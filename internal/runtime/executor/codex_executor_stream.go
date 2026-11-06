@@ -163,6 +163,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			bootstrapStart = nowCodexBootstrap()
 		}
 	}
+	streamStartedAt := time.Now()
 	httpResp, err := doCodexRequest(httpClient, httpReq, upstreamBody, prepareHeaders, responseReady)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
@@ -262,6 +263,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				translatedLine = append([]byte("data: "), data...)
 				eventType := ojson.GetBytesNoCopy(data, "type").String()
 				if streamErr, terminalBody, ok := codexTerminalFailureErrWithCooling(data, e.modelLevelCooling()); ok {
+					helps.LogProviderStreamFailure(ctx, httpResp, terminalBody, streamStartedAt)
 					closeBootstrapBody()
 					if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody); errClearReplay != nil {
 						helps.RecordAPIResponseError(ctx, e.cfg, errClearReplay)
@@ -374,6 +376,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 		if !streamStarted && bootstrapTerminalErr == nil {
 			closeBootstrapBody()
+			helps.LogIncompleteResponseStream(ctx, httpResp, scanner.Err(), streamStartedAt)
 			if errScan := scanner.Err(); errScan != nil {
 				// A cancelled downstream request must not be recorded as an upstream failure or
 				// penalise the credential; mirror the unbuffered goroutine's guard.
@@ -462,6 +465,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				translatedLine = append([]byte("data: "), data...)
 				eventType := ojson.GetBytesNoCopy(data, "type").String()
 				if streamErr, terminalBody, ok := codexTerminalFailureErrWithCooling(data, e.modelLevelCooling()); ok {
+					helps.LogProviderStreamFailure(ctx, httpResp, terminalBody, streamStartedAt)
 					if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody); errClearReplay != nil {
 						helps.RecordAPIResponseError(ctx, e.cfg, errClearReplay)
 						reporter.PublishFailure(ctx, errClearReplay)
@@ -538,6 +542,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				return
 			}
 		}
+		helps.LogIncompleteResponseStream(ctx, httpResp, scanner.Err(), streamStartedAt)
 		if errScan := scanner.Err(); errScan != nil {
 			if ctx.Err() != nil {
 				return
