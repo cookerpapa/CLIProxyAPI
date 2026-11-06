@@ -319,6 +319,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.SanitizeClaudeKeys()
 
 	// Sanitize OpenAI compatibility providers: drop entries without base-url
+	if errWireAPI := ValidateOpenAICompatibilityWireAPI(cfg.OpenAICompatibility); errWireAPI != nil {
+		return nil, errWireAPI
+	}
 	cfg.SanitizeOpenAICompatibility()
 
 	// Normalize OAuth provider model exclusion map.

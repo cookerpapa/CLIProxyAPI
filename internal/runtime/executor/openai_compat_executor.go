@@ -53,6 +53,12 @@ type OpenAICompatExecutor struct {
 	cfg      *config.Config
 }
 
+// A generated response or malformed native stream does not establish that the
+// selected credential is unavailable. Let the caller own any semantic retry.
+type openAICompatNativeResponseError struct{ statusErr }
+
+func (openAICompatNativeResponseError) IsRequestScoped() bool { return true }
+
 // NewOpenAICompatExecutor creates an executor bound to a provider key (e.g., "openrouter").
 func NewOpenAICompatExecutor(provider string, cfg *config.Config) *OpenAICompatExecutor {
 	return &OpenAICompatExecutor{provider: provider, cfg: cfg}
@@ -112,7 +118,8 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 
 func (e *OpenAICompatExecutor) executeWithCredentials(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, baseURL, apiKey string, compat *config.OpenAICompatibility) (resp cliproxyexecutor.Response, err error) {
 	ctx = helps.EnsureSessionContext(ctx, opts, req.Payload)
-	if opts.SourceFormat == sdktranslator.FormatOpenAIResponse {
+	nativeResponses := compat != nil && strings.EqualFold(strings.TrimSpace(compat.WireAPI), "responses")
+	if !nativeResponses && opts.SourceFormat == sdktranslator.FormatOpenAIResponse {
 		if opts.Alt == "responses/compact" {
 			if errExpand := helps.ExpandRecognizedResponsesCompactionCapsules(&req, &opts); errExpand != nil {
 				return resp, statusErr{code: http.StatusBadRequest, msg: errExpand.Error()}
@@ -141,6 +148,10 @@ func (e *OpenAICompatExecutor) executeWithCredentials(ctx context.Context, auth 
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("openai")
 	endpoint := "/chat/completions"
+	if nativeResponses {
+		to = sdktranslator.FormatOpenAIResponse
+		endpoint = "/responses"
+	}
 	if opts.Alt == "responses/compact" {
 		to = sdktranslator.FromString("openai-response")
 		endpoint = "/responses/compact"
@@ -152,13 +163,22 @@ func (e *OpenAICompatExecutor) executeWithCredentials(ctx context.Context, auth 
 	originalPayload := originalPayloadSource
 	isCompat := helps.APIKeyModelIsCompat(req)
 	targetModel := resolveResponsesSignatureTargetModel(baseModel, req, opts)
-	originalTranslated, translated, updatesChanged, err := helps.TranslateRequestPairWithAPIKeyModelCompatibilityAndUpdateIntent(ctx, opts.Headers, e.cfg, from, to, targetModel, originalPayload, req.Payload, opts.Stream, isCompat)
+	var originalTranslated, translated []byte
+	var updatesChanged bool
+	if nativeResponses {
+		originalTranslated, translated, updatesChanged, err = e.nativeResponsesRequests(ctx, req, opts, targetModel, originalPayload, false)
+	} else {
+		originalTranslated, translated, updatesChanged, err = helps.TranslateRequestPairWithAPIKeyModelCompatibilityAndUpdateIntent(ctx, opts.Headers, e.cfg, from, to, targetModel, originalPayload, req.Payload, opts.Stream, isCompat)
+	}
 	if err != nil {
 		return resp, err
 	}
 	originalTranslated = helps.SetStringIfDifferent(originalTranslated, "model", baseModel)
 	doc := ojson.NewDoc(translated)
 	helps.SetStringIfDifferentDoc(doc, "model", baseModel)
+	if nativeResponses {
+		helps.SetBoolIfDifferentDoc(doc, "stream", false)
+	}
 
 	if err = helps.ApplyRequestThinkingDoc(doc, req, opts, from.String(), to.String(), e.Identifier(), updatesChanged); err != nil {
 		return resp, err
@@ -166,10 +186,10 @@ func (e *OpenAICompatExecutor) executeWithCredentials(ctx context.Context, auth 
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
-	if helps.ShouldNormalizeOpenAIToolResultsForModel(compat, baseModel, requestedModel) {
+	if !nativeResponses && helps.ShouldNormalizeOpenAIToolResultsForModel(compat, baseModel, requestedModel) {
 		helps.NormalizeOpenAIToolResultsTextOnlyDoc(doc)
 	}
-	if opts.Alt != "responses/compact" {
+	if !nativeResponses && opts.Alt != "responses/compact" {
 		useMCT := helps.ShouldUseMaxCompletionTokensForModel(compat, baseModel, requestedModel)
 		helps.NormalizeOpenAIMaxTokensDoc(doc, useMCT)
 		if err = e.applyPromptCacheKeyWithCompatDoc(ctx, auth, compat, from, baseModel, req, opts, doc); err != nil {
@@ -178,7 +198,9 @@ func (e *OpenAICompatExecutor) executeWithCredentials(ctx context.Context, auth 
 	}
 	if opts.Alt == "responses/compact" {
 		_ = doc.Delete("stream")
-		sanitizeOpenAIResponsesReasoningEncryptedContentWithCompatModelAndBaseURLDoc(ctx, "openai compat executor", doc, true, resolveResponsesSignatureTargetModel(baseModel, req, opts), baseURL)
+		if !nativeResponses {
+			sanitizeOpenAIResponsesReasoningEncryptedContentWithCompatModelAndBaseURLDoc(ctx, "openai compat executor", doc, true, resolveResponsesSignatureTargetModel(baseModel, req, opts), baseURL)
+		}
 	}
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
 	helps.ApplyPayloadConfigWithRequestDoc(e.cfg, baseModel, to.String(), from.String(), "", doc, originalTranslated, requestedModel, requestPath, opts.Headers)
@@ -243,10 +265,27 @@ func (e *OpenAICompatExecutor) executeWithCredentials(ctx context.Context, auth 
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, body)
 	reporter.ObserveResponseModel(body)
+	if nativeResponses && opts.Alt != "responses/compact" {
+		status := ojson.GetBytesNoCopy(body, "status").String()
+		if !json.Valid(body) || (status != "completed" && status != "incomplete") {
+			err = openAICompatNativeResponseError{statusErr{code: http.StatusBadGateway, msg: string(body)}}
+			reporter.PublishFailureWithDetail(ctx, helps.ParseOpenAIUsage(body), err)
+			return resp, err
+		}
+	}
 	// Ensure we at least record the request even if upstream doesn't return usage
 	// Translate response back to source format when needed
 	var param any
-	out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, helps.ApplyPatchOriginalRequest(req, opts), translated, body, &param)
+	var out []byte
+	if nativeResponses {
+		var handled bool
+		out, handled = sdktranslator.TranslateNonStreamChecked(ctx, to, responseFormat, req.Model, helps.ApplyPatchOriginalRequest(req, opts), translated, body, &param)
+		if !handled {
+			return resp, openAICompatNativeResponseError{statusErr{code: http.StatusBadGateway, msg: "native Responses response translation declined"}}
+		}
+	} else {
+		out = sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, helps.ApplyPatchOriginalRequest(req, opts), translated, body, &param)
+	}
 	if helps.ApplyPatchTranslationError(param) != nil || len(out) == 0 {
 		return cliproxyexecutor.Response{}, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}
 	}
@@ -364,7 +403,8 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 
 func (e *OpenAICompatExecutor) executeStreamWithCredentials(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, baseURL, apiKey string, compat *config.OpenAICompatibility) (_ *cliproxyexecutor.StreamResult, err error) {
 	ctx = helps.EnsureSessionContext(ctx, opts, req.Payload)
-	if opts.SourceFormat == sdktranslator.FormatOpenAIResponse && opts.Alt != "responses/compact" {
+	nativeResponses := compat != nil && strings.EqualFold(strings.TrimSpace(compat.WireAPI), "responses")
+	if !nativeResponses && opts.SourceFormat == sdktranslator.FormatOpenAIResponse && opts.Alt != "responses/compact" {
 		if errExpand := helps.ExpandResponsesCompactionCapsules(&req, &opts, e.Identifier()); errExpand != nil {
 			return nil, statusErr{code: http.StatusBadRequest, msg: errExpand.Error()}
 		}
@@ -386,6 +426,9 @@ func (e *OpenAICompatExecutor) executeStreamWithCredentials(ctx context.Context,
 	from := opts.SourceFormat
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("openai")
+	if nativeResponses {
+		to = sdktranslator.FormatOpenAIResponse
+	}
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
@@ -393,13 +436,22 @@ func (e *OpenAICompatExecutor) executeStreamWithCredentials(ctx context.Context,
 	originalPayload := originalPayloadSource
 	isCompat := helps.APIKeyModelIsCompat(req)
 	targetModel := resolveResponsesSignatureTargetModel(baseModel, req, opts)
-	originalTranslated, translated, updatesChanged, err := helps.TranslateRequestPairWithAPIKeyModelCompatibilityAndUpdateIntent(ctx, opts.Headers, e.cfg, from, to, targetModel, originalPayload, req.Payload, true, isCompat)
+	var originalTranslated, translated []byte
+	var updatesChanged bool
+	if nativeResponses {
+		originalTranslated, translated, updatesChanged, err = e.nativeResponsesRequests(ctx, req, opts, targetModel, originalPayload, true)
+	} else {
+		originalTranslated, translated, updatesChanged, err = helps.TranslateRequestPairWithAPIKeyModelCompatibilityAndUpdateIntent(ctx, opts.Headers, e.cfg, from, to, targetModel, originalPayload, req.Payload, true, isCompat)
+	}
 	if err != nil {
 		return nil, err
 	}
 	originalTranslated = helps.SetStringIfDifferent(originalTranslated, "model", baseModel)
 	doc := ojson.NewDoc(translated)
 	helps.SetStringIfDifferentDoc(doc, "model", baseModel)
+	if nativeResponses {
+		helps.SetBoolIfDifferentDoc(doc, "stream", opts.Stream)
+	}
 
 	if err = helps.ApplyRequestThinkingDoc(doc, req, opts, from.String(), to.String(), e.Identifier(), updatesChanged); err != nil {
 		return nil, err
@@ -407,10 +459,10 @@ func (e *OpenAICompatExecutor) executeStreamWithCredentials(ctx context.Context,
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
-	if helps.ShouldNormalizeOpenAIToolResultsForModel(compat, baseModel, requestedModel) {
+	if !nativeResponses && helps.ShouldNormalizeOpenAIToolResultsForModel(compat, baseModel, requestedModel) {
 		helps.NormalizeOpenAIToolResultsTextOnlyDoc(doc)
 	}
-	if opts.Alt != "responses/compact" {
+	if !nativeResponses && opts.Alt != "responses/compact" {
 		useMCT := helps.ShouldUseMaxCompletionTokensForModel(compat, baseModel, requestedModel)
 		helps.NormalizeOpenAIMaxTokensDoc(doc, useMCT)
 		if err = e.applyPromptCacheKeyWithCompatDoc(ctx, auth, compat, from, baseModel, req, opts, doc); err != nil {
@@ -420,9 +472,15 @@ func (e *OpenAICompatExecutor) executeStreamWithCredentials(ctx context.Context,
 
 	// Request usage data in the final streaming chunk so that token statistics
 	// are captured even when the upstream is an OpenAI-compatible provider.
-	helps.SetBoolIfDifferentDoc(doc, "stream_options.include_usage", true)
+	endpoint := "/chat/completions"
+	if nativeResponses {
+		endpoint = "/responses"
+		helps.SetBoolIfDifferentDoc(doc, "stream", true)
+	} else {
+		helps.SetBoolIfDifferentDoc(doc, "stream_options.include_usage", true)
+	}
 
-	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
+	url := strings.TrimSuffix(baseURL, "/") + endpoint
 	helps.ApplyPayloadConfigWithRequestDoc(e.cfg, baseModel, to.String(), from.String(), "", doc, originalTranslated, requestedModel, requestPath, opts.Headers)
 	translated = doc.Bytes()
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
@@ -510,8 +568,12 @@ func (e *OpenAICompatExecutor) executeStreamWithCredentials(ctx context.Context,
 			if !streamUsage.PublishFailure(ctx, reporter, loggedErr) {
 				reporter.PublishFailure(ctx, loggedErr)
 			}
+			var outgoing error = streamErr
+			if nativeResponses {
+				outgoing = openAICompatNativeResponseError{streamErr}
+			}
 			select {
-			case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
+			case out <- cliproxyexecutor.StreamChunk{Err: outgoing}:
 			case <-ctx.Done():
 			}
 			streamFailed = true
@@ -540,6 +602,10 @@ func (e *OpenAICompatExecutor) executeStreamWithCredentials(ctx context.Context,
 			}
 			dataPayload := bytes.TrimSpace(bytes.Join(dataLines, []byte("\n")))
 			isDone := bytes.Equal(dataPayload, []byte("[DONE]"))
+			if nativeResponses && isDone {
+				publishStreamError(statusErr{code: http.StatusBadGateway, msg: "upstream native Responses stream closed before terminal event", streamTruncated: true}, false)
+				return true
+			}
 			if isDone && openAICompatErrorEvent(eventName) {
 				publishStreamError(statusErr{code: http.StatusBadGateway, msg: "upstream error event ended before [DONE]"}, false)
 				return true
@@ -549,7 +615,8 @@ func (e *OpenAICompatExecutor) executeStreamWithCredentials(ctx context.Context,
 				return true
 			}
 			if !isDone {
-				if streamErr, isError := openAICompatStreamDataError(dataPayload, eventName); isError {
+				isNativeFailure := nativeResponses && ojson.GetBytesNoCopy(dataPayload, "type").String() == "response.failed"
+				if streamErr, isError := openAICompatStreamDataError(dataPayload, eventName); isError && !isNativeFailure {
 					publishStreamError(streamErr, true)
 					return true
 				}
@@ -558,13 +625,55 @@ func (e *OpenAICompatExecutor) executeStreamWithCredentials(ctx context.Context,
 				}
 			}
 
+			nativeFailed := false
+			if nativeResponses {
+				streamUsage.ObserveResponsesStream(dataPayload)
+				kind := ojson.GetBytesNoCopy(dataPayload, "type").String()
+				switch kind {
+				case "response.completed", "response.incomplete", "response.failed":
+					status := ojson.GetBytesNoCopy(dataPayload, "response.status").String()
+					if status != strings.TrimPrefix(kind, "response.") {
+						publishStreamError(statusErr{code: http.StatusBadGateway, msg: "upstream native Responses terminal event has invalid status"}, false)
+						return true
+					}
+					isDone = true
+					nativeFailed = kind == "response.failed"
+				}
+			}
+
 			// Observe complete upstream frames before translation or downstream backpressure.
-			if !isDone && len(dataLines) > 1 {
+			if !nativeResponses && !isDone && len(dataLines) > 1 {
 				streamUsage.ObserveOpenAIStream(dataPayload)
 			}
-			helps.ObserveChatTokenEvent(reporter, dataPayload)
+			if nativeResponses {
+				helps.ObserveResponsesTokenEvent(reporter, dataPayload)
+			} else {
+				helps.ObserveChatTokenEvent(reporter, dataPayload)
+			}
 			streamLine := append([]byte("data: "), dataPayload...)
-			chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, helps.ApplyPatchOriginalRequest(req, opts), translated, streamLine, &param, claudeInputTokens)
+			var chunks [][]byte
+			if nativeResponses {
+				wire := streamLine
+				if responseFormat == sdktranslator.FormatOpenAIResponse {
+					var frame bytes.Buffer
+					if eventName != "" {
+						fmt.Fprintf(&frame, "event: %s\n", eventName)
+					}
+					for _, line := range dataLines {
+						fmt.Fprintf(&frame, "data: %s\n", line)
+					}
+					frame.WriteByte('\n')
+					wire = frame.Bytes()
+				}
+				var handled bool
+				chunks, handled = sdktranslator.TranslateStreamChecked(ctx, to, responseFormat, req.Model, helps.ApplyPatchOriginalRequest(req, opts), translated, wire, &param)
+				if !handled {
+					publishStreamError(statusErr{code: http.StatusBadGateway, msg: "native Responses stream translation declined"}, false)
+					return true
+				}
+			} else {
+				chunks = helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, helps.ApplyPatchOriginalRequest(req, opts), translated, streamLine, &param, claudeInputTokens)
+			}
 			helps.RecordApplyPatchStreamFailure(ctx, param, reporter, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage})
 			for i := range chunks {
 				select {
@@ -578,6 +687,13 @@ func (e *OpenAICompatExecutor) executeStreamWithCredentials(ctx context.Context,
 				publishStreamError(statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}, false)
 				return true
 			}
+			if nativeFailed {
+				failure := openAICompatNativeResponseError{statusErr{code: http.StatusBadGateway, msg: "upstream native Responses failed"}}
+				if !streamUsage.PublishFailure(ctx, reporter, failure) {
+					reporter.PublishFailure(ctx, failure)
+				}
+				streamFailed = true
+			}
 			if isDone {
 				seenDone = true
 				return true
@@ -589,7 +705,9 @@ func (e *OpenAICompatExecutor) executeStreamWithCredentials(ctx context.Context,
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-			streamUsage.ObserveOpenAIStream(line)
+			if !nativeResponses {
+				streamUsage.ObserveOpenAIStream(line)
+			}
 			trimmedLine := bytes.TrimSpace(line)
 			if len(trimmedLine) == 0 {
 				if processFrame() {
@@ -620,7 +738,7 @@ func (e *OpenAICompatExecutor) executeStreamWithCredentials(ctx context.Context,
 		if !streamFailed && !streamAborted && helps.EndApplyPatchStream(ctx, param, reporter, out, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}) {
 			return
 		}
-		if !streamFailed && !streamAborted && !seenDone && errScan == nil && responseFormat == sdktranslator.FormatOpenAIResponse && ctx.Err() == nil && helps.CanFinalizeResponseStream(param) {
+		if !nativeResponses && !streamFailed && !streamAborted && !seenDone && errScan == nil && responseFormat == sdktranslator.FormatOpenAIResponse && ctx.Err() == nil && helps.CanFinalizeResponseStream(param) {
 			finalChunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, helps.ApplyPatchOriginalRequest(req, opts), translated, []byte("data: [DONE]"), &param, claudeInputTokens)
 			for _, finalChunk := range finalChunks {
 				select {
@@ -637,6 +755,10 @@ func (e *OpenAICompatExecutor) executeStreamWithCredentials(ctx context.Context,
 			}
 		}
 		if streamFailed || streamAborted {
+			return
+		}
+		if nativeResponses && !seenDone && errScan == nil {
+			publishStreamError(statusErr{code: http.StatusBadGateway, msg: "upstream native Responses stream closed before terminal event", streamTruncated: true}, false)
 			return
 		}
 		if errScan != nil && !seenDone {

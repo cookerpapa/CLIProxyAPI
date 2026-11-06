@@ -974,5 +974,8 @@ func ValidateV8Config(data []byte) error {
 	if errDecode := decoder.Decode(&cfg); errDecode != nil {
 		return errDecode
 	}
+	if errWireAPI := ValidateOpenAICompatibilityWireAPI(cfg.OpenAICompatibility); errWireAPI != nil {
+		return errWireAPI
+	}
 	return cfg.Models.Validate()
 }

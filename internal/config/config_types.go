@@ -1053,6 +1053,10 @@ type OpenAICompatibility struct {
 	// Name is the identifier for this OpenAI compatibility configuration.
 	Name string `yaml:"name" json:"name"`
 
+	// WireAPI selects the upstream protocol without changing the downstream API.
+	// Empty and chat-completions retain the default; responses preserves native items.
+	WireAPI string `yaml:"wire-api,omitempty" json:"wire-api,omitempty"`
+
 	// Priority controls selection preference when multiple providers or credentials match.
 	// Higher values are preferred; defaults to 0.
 	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`

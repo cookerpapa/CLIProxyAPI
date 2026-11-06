@@ -112,6 +112,13 @@ func (r *Registry) TranslateRequest(from, to Format, model string, rawJSON []byt
 // TranslateRequestEnvelope translates a complete request envelope while preserving
 // request-scoped metadata for the selected transform.
 func (r *Registry) TranslateRequestEnvelope(ctx context.Context, from, to Format, req RequestEnvelope) RequestEnvelope {
+	result, _ := r.TranslateRequestEnvelopeChecked(ctx, from, to, req)
+	return result
+}
+
+// TranslateRequestEnvelopeChecked reports whether an actual transform or identity
+// route handled this payload, preserving the ordinary fallback for other callers.
+func (r *Registry) TranslateRequestEnvelopeChecked(ctx context.Context, from, to Format, req RequestEnvelope) (RequestEnvelope, bool) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -135,7 +142,7 @@ func (r *Registry) TranslateRequestEnvelope(ctx context.Context, from, to Format
 			req.ConfigurationUpdatesChanged = req.ConfigurationUpdatesChanged || updatesChanged(before, configurationUpdates(req.Body))
 		}
 		req.Format = to
-		return req
+		return req, true
 	}
 
 	if req.Model != "" && ojson.GetBytesNoCopy(req.Body, "model").String() != req.Model {
@@ -149,7 +156,7 @@ func (r *Registry) TranslateRequestEnvelope(ctx context.Context, from, to Format
 		// No translation occurred. Preserve the documented fallback shape instead
 		// of mixing target-protocol summary fields into the source payload.
 		req.Format = to
-		return req
+		return req, from == to
 	}
 
 	// Plugin request normalizers canonicalize the source before a plugin request
@@ -159,11 +166,13 @@ func (r *Registry) TranslateRequestEnvelope(ctx context.Context, from, to Format
 	req.Body = hooks.NormalizeRequest(ctx, from, to, req.Model, req.Body, req.Stream)
 	req.ConfigurationUpdatesChanged = req.ConfigurationUpdatesChanged || updatesChanged(before, configurationUpdates(req.Body))
 	summaryConfig := thinking.ExtractTranslatedSummaryConfig(req.Body, from.String(), to.String())
+	handled := from == to
 	if translated, ok := hooks.TranslateRequest(ctx, from, to, req.Model, req.Body, req.Stream); ok {
 		req.Body = thinking.ApplySummaryConfigForModel(translated, to.String(), req.Model, summaryConfig)
+		handled = true
 	}
 	req.Format = to
-	return req
+	return req, handled
 }
 
 // configurationUpdates captures only Responses update items before and after a plugin
@@ -262,6 +271,12 @@ func (r *Registry) HasTokenCountTransformer(from, to Format) bool {
 
 // TranslateStream applies the registered streaming response translator.
 func (r *Registry) TranslateStream(ctx context.Context, from, to Format, model string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) [][]byte {
+	result, _ := r.TranslateStreamChecked(ctx, from, to, model, originalRequestRawJSON, requestRawJSON, rawJSON, param)
+	return result
+}
+
+// TranslateStreamChecked reports whether a transform or identity route handled the payload.
+func (r *Registry) TranslateStreamChecked(ctx context.Context, from, to Format, model string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) ([][]byte, bool) {
 	r.mu.RLock()
 	var stream ResponseStreamTransform
 	if byTarget, ok := r.responses[to]; ok {
@@ -277,17 +292,20 @@ func (r *Registry) TranslateStream(ctx context.Context, from, to Format, model s
 
 	var outputs [][]byte
 	usedNativeTransform := false
+	handled := from == to
 	if stream != nil {
 		usedNativeTransform = true
+		handled = true
 		outputs = stream(ctx, model, originalRequestRawJSON, requestRawJSON, body, param)
 	} else if hooks != nil {
 		if translated, ok := hooks.TranslateResponse(ctx, from, to, model, originalRequestRawJSON, requestRawJSON, body, true); ok {
 			outputs = [][]byte{translated}
+			handled = true
 		}
 	}
 	// Retained tool failures are never recovered by raw fallback or plugin normalization.
 	if translationToolInputFailed(param) {
-		return outputs
+		return outputs, handled
 	}
 	if outputs == nil && !usedNativeTransform {
 		outputs = [][]byte{body}
@@ -297,11 +315,17 @@ func (r *Registry) TranslateStream(ctx context.Context, from, to Format, model s
 			outputs[i] = hooks.NormalizeResponseAfter(ctx, from, to, model, originalRequestRawJSON, requestRawJSON, output, true)
 		}
 	}
-	return outputs
+	return outputs, handled
 }
 
 // TranslateNonStream applies the registered non-stream response translator.
 func (r *Registry) TranslateNonStream(ctx context.Context, from, to Format, model string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) []byte {
+	result, _ := r.TranslateNonStreamChecked(ctx, from, to, model, originalRequestRawJSON, requestRawJSON, rawJSON, param)
+	return result
+}
+
+// TranslateNonStreamChecked reports whether a transform or identity route handled the payload.
+func (r *Registry) TranslateNonStreamChecked(ctx context.Context, from, to Format, model string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) ([]byte, bool) {
 	r.mu.RLock()
 	var fn ResponseTransform
 	if byTarget, ok := r.responses[to]; ok {
@@ -311,23 +335,26 @@ func (r *Registry) TranslateNonStream(ctx context.Context, from, to Format, mode
 	r.mu.RUnlock()
 
 	body := rawJSON
+	handled := from == to
 	if hooks != nil {
 		body = hooks.NormalizeResponseBefore(ctx, from, to, model, originalRequestRawJSON, requestRawJSON, body, false)
 	}
 	if fn.NonStream != nil {
+		handled = true
 		body = fn.NonStream(ctx, model, originalRequestRawJSON, requestRawJSON, body, param)
 	} else if hooks != nil {
 		if translated, ok := hooks.TranslateResponse(ctx, from, to, model, originalRequestRawJSON, requestRawJSON, body, false); ok {
 			body = translated
+			handled = true
 		}
 	}
 	if translationToolInputFailed(param) || (fn.NonStream != nil && body == nil) {
-		return nil
+		return nil, handled
 	}
 	if hooks != nil {
 		body = hooks.NormalizeResponseAfter(ctx, from, to, model, originalRequestRawJSON, requestRawJSON, body, false)
 	}
-	return body
+	return body, handled
 }
 
 // translationToolInputFailed consumes only the optional, request-local error contract.
@@ -457,4 +484,19 @@ func TranslateTokenCount(ctx context.Context, from, to Format, count int64, rawJ
 
 func hasAnyResponseTransform(fn ResponseTransform) bool {
 	return fn.Stream != nil || fn.NonStream != nil || fn.TokenCount != nil
+}
+
+// TranslateRequestEnvelopeChecked uses the default registry with route evidence.
+func TranslateRequestEnvelopeChecked(ctx context.Context, from, to Format, req RequestEnvelope) (RequestEnvelope, bool) {
+	return defaultRegistry.TranslateRequestEnvelopeChecked(ctx, from, to, req)
+}
+
+// TranslateStreamChecked uses the default registry with route evidence.
+func TranslateStreamChecked(ctx context.Context, from, to Format, model string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) ([][]byte, bool) {
+	return defaultRegistry.TranslateStreamChecked(ctx, from, to, model, originalRequestRawJSON, requestRawJSON, rawJSON, param)
+}
+
+// TranslateNonStreamChecked uses the default registry with route evidence.
+func TranslateNonStreamChecked(ctx context.Context, from, to Format, model string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) ([]byte, bool) {
+	return defaultRegistry.TranslateNonStreamChecked(ctx, from, to, model, originalRequestRawJSON, requestRawJSON, rawJSON, param)
 }
